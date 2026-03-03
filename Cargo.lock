@@ -399,6 +399,7 @@ dependencies = [
  "serde",
  "serde_json",
  "subprocess",
+ "termin",
  "tokio",
  "tracing",
  "tracing-appender",
@@ -2989,6 +2990,14 @@ dependencies = [
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "termin"
+version = "0.1.0"
+source = "git+https://github.com/pinpinroku/termin?branch=main#f459ba34b7c62752933e984056abebf3bbda161f"
+dependencies = [
+ "tracing",
 ]
 
 [[package]]
