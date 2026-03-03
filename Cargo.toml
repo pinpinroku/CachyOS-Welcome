@@ -35,6 +35,7 @@ zbus = { version = "5", features = ["tokio"], default-features = false }
 zbus_systemd = { version = "0.25900.0", features = ["systemd1"], default-features = false }
 clap = { features = ["derive"], version = "4" }
 colored = "3"
+termin = { git = "https://github.com/pinpinroku/termin", branch = "main" }
 
 [build-dependencies]
 anyhow = "1"
