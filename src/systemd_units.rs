@@ -2,6 +2,15 @@ use std::sync::{LazyLock, Mutex};
 
 use tokio::runtime::Runtime;
 use tracing::error;
+use zbus::proxy::MethodFlags;
+use zbus::zvariant;
+
+/// Whether to operate on the system-wide or per-user systemd instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    System,
+    User,
+}
 
 static MANAGER: LazyLock<Mutex<SystemdUnitManager>> =
     LazyLock::new(|| Mutex::new(SystemdUnitManager::new()));
@@ -121,4 +130,99 @@ pub fn check_user_units(units_str: &str) -> bool {
 /// Checks if any units enabled
 pub fn check_any_units(units_str: &str) -> bool {
     MANAGER.lock().unwrap().any_enabled(units_str)
+}
+
+async fn connection_for_scope(scope: Scope) -> anyhow::Result<zbus::Connection> {
+    Ok(match scope {
+        Scope::System => zbus::Connection::system().await?,
+        Scope::User => zbus::Connection::session().await?,
+    })
+}
+
+const REPLACE_MODE: &str = "replace";
+
+/// Call a unit-level method (`StartUnit`, `StopUnit`, `RestartUnit`) with polkit interactive auth.
+async fn call_unit_method(
+    manager: &zbus_systemd::systemd1::ManagerProxy<'_>,
+    method: &str,
+    unit: &str,
+) -> zbus::Result<Option<zvariant::OwnedObjectPath>> {
+    let flags = MethodFlags::AllowInteractiveAuth.into();
+    manager
+        .inner()
+        .call_with_flags(method, flags, &(unit.to_string(), REPLACE_MODE.to_string()))
+        .await
+}
+
+/// Enable units and start them
+pub fn systemd_enable(units: &[&str], scope: Scope, force: bool) -> anyhow::Result<()> {
+    let rt = Runtime::new()?;
+    rt.block_on(async {
+        let conn = connection_for_scope(scope).await?;
+        let manager = zbus_systemd::systemd1::ManagerProxy::new(&conn).await?;
+        let files: Vec<String> = units.iter().map(std::string::ToString::to_string).collect();
+        let flags = MethodFlags::AllowInteractiveAuth.into();
+        #[allow(clippy::type_complexity)]
+        let _: Option<(bool, Vec<(String, String, String)>)> = manager
+            .inner()
+            .call_with_flags("EnableUnitFiles", flags, &(files, false, force))
+            .await?;
+        for unit in units {
+            call_unit_method(&manager, "StartUnit", unit).await?;
+        }
+        Ok(())
+    })
+}
+
+/// Stop units and disable them
+pub fn systemd_disable(units: &[&str], scope: Scope) -> anyhow::Result<()> {
+    let rt = Runtime::new()?;
+    rt.block_on(async {
+        let conn = connection_for_scope(scope).await?;
+        let manager = zbus_systemd::systemd1::ManagerProxy::new(&conn).await?;
+        for unit in units {
+            // NOTE: unit may already be inactive
+            let _ = call_unit_method(&manager, "StopUnit", unit).await;
+        }
+        let files: Vec<String> = units.iter().map(std::string::ToString::to_string).collect();
+        let flags = MethodFlags::AllowInteractiveAuth.into();
+        let _: Option<Vec<(String, String, String)>> =
+            manager.inner().call_with_flags("DisableUnitFiles", flags, &(files, false)).await?;
+        Ok(())
+    })
+}
+
+/// Restart a single unit
+pub fn systemd_restart(unit: &str, scope: Scope) -> anyhow::Result<()> {
+    let rt = Runtime::new()?;
+    rt.block_on(async {
+        let conn = connection_for_scope(scope).await?;
+        let manager = zbus_systemd::systemd1::ManagerProxy::new(&conn).await?;
+        call_unit_method(&manager, "RestartUnit", unit).await?;
+        Ok(())
+    })
+}
+
+/// Stop a single unit
+pub fn systemd_stop(unit: &str, scope: Scope) -> anyhow::Result<()> {
+    let rt = Runtime::new()?;
+    rt.block_on(async {
+        let conn = connection_for_scope(scope).await?;
+        let manager = zbus_systemd::systemd1::ManagerProxy::new(&conn).await?;
+        call_unit_method(&manager, "StopUnit", unit).await?;
+        Ok(())
+    })
+}
+
+/// Check whether a unit is currently active.
+pub fn systemd_is_active(unit: &str, scope: Scope) -> anyhow::Result<bool> {
+    let rt = Runtime::new()?;
+    rt.block_on(async {
+        let conn = connection_for_scope(scope).await?;
+        let manager = zbus_systemd::systemd1::ManagerProxy::new(&conn).await?;
+        let path = manager.get_unit(unit.to_string()).await?;
+        let unit_proxy =
+            zbus_systemd::systemd1::UnitProxy::builder(&conn).path(path)?.build().await?;
+        Ok(unit_proxy.active_state().await? == "active")
+    })
 }

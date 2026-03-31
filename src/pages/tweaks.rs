@@ -1,3 +1,4 @@
+use crate::systemd_units::Scope;
 use crate::tweak::{self, TweakName};
 use crate::ui::{MessageType, UI};
 use crate::{fl, systemd_units, utils};
@@ -5,6 +6,7 @@ use crate::{fl, systemd_units, utils};
 use std::str;
 
 use gtk::prelude::*;
+use subprocess::Exec;
 
 use glib::translate::FromGlib;
 use gtk::glib;
@@ -19,7 +21,7 @@ macro_rules! create_tweak_checkbox {
         set_tweak_check_data(&temp_btn, $tweak_name);
 
         let (_, action_data, _) = tweak::get_details($tweak_name);
-        connect_tweak(&temp_btn, action_data);
+        connect_tweak(&temp_btn, $tweak_name, action_data);
         temp_btn
     }};
 }
@@ -30,8 +32,10 @@ fn set_tweak_check_data(check_btn: &gtk::CheckButton, tweak_name: TweakName) {
     }
 }
 
-fn connect_tweak(check_btn: &gtk::CheckButton, action_data: &'static str) {
-    check_btn.set_active(systemd_units::check_any_units(action_data));
+fn connect_tweak(check_btn: &gtk::CheckButton, tweak_name: TweakName, action_data: &'static str) {
+    let is_active =
+        systemd_units::check_any_units(action_data) || tweak::check_autostart_active(tweak_name);
+    check_btn.set_active(is_active);
 
     connect_clicked_and_save(check_btn, on_servbtn_clicked);
 }
@@ -87,14 +91,13 @@ fn toggle_service(
     } else {
         systemd_units::check_system_units(action_data)
     };
-    let (cmd, run_as_root) = utils::get_tweak_toggle_cmd(action_type, action_data, action_enabled);
-
     // Create context channel.
     let (tx, rx) = glib::MainContext::channel(glib::Priority::default());
 
     let dialog_text = fl!("package-not-installed", package_name = alpm_package_name);
 
     let action_type = action_type.to_owned();
+    let action_data = action_data.to_owned();
     let alpm_package_name = alpm_package_name.to_owned();
     // Spawn child process in separate thread.
     std::thread::spawn(move || {
@@ -111,7 +114,22 @@ fn toggle_service(
                 return;
             }
         }
-        utils::run_cmd(cmd, run_as_root).unwrap();
+
+        let scope = if action_type == "user_service" { Scope::User } else { Scope::System };
+        let units: Vec<&str> = action_data.split_whitespace().collect();
+        if action_enabled {
+            let _ = systemd_units::systemd_disable(&units, scope);
+        } else {
+            let _ = systemd_units::systemd_enable(&units, scope, true);
+        }
+
+        if action_enabled && action_type == "user_service" {
+            if tweak::is_globally_enabled(&action_data) {
+                let _ =
+                    Exec::cmd("/sbin/systemctl").args(&["--global", "disable"]).args(&units).join();
+            }
+            tweak::remove_autostart_files(tweak_name);
+        }
 
         if action_type == "user_service" {
             systemd_units::refresh_user_cache();

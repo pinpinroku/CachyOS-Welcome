@@ -1,58 +1,96 @@
+use crate::systemd_units::Scope;
 use crate::ui::{Action, DialogMessage, MessageType, RunCmdCallback};
-use crate::{fl, kwin_dbus, systemd_units, utils, PacmanWrapper};
+use crate::{dns, fl, kwin_dbus, systemd_units, utils, PacmanWrapper};
 
-use std::env;
 use std::path::Path;
+use std::time::Duration;
+use std::{env, io, thread};
 
 use gtk::glib::Sender;
-use subprocess::{Exec, Redirection};
+use subprocess::Exec;
 use tracing::error;
 
+fn nmcli_mod(conn_name: &str, property: &str, value: &str) -> anyhow::Result<()> {
+    let status =
+        Exec::cmd("/sbin/nmcli").args(&["con", "mod", conn_name, property, value]).join()?;
+    anyhow::ensure!(status.success(), "nmcli con mod {property} failed");
+    Ok(())
+}
+
 pub fn get_nm_connections() -> Vec<String> {
-    let connections = Exec::cmd("/sbin/nmcli")
-        .args(&["-t", "-f", "NAME", "connection", "show"])
-        .stdout(Redirection::Pipe)
-        .capture()
-        .unwrap()
-        .stdout_str();
+    let connections = utils::cmd_output("/sbin/nmcli", &["-t", "-f", "NAME", "connection", "show"]);
 
     // get list of connections separated by newline
     connections.split('\n').filter(|x| !x.is_empty()).map(String::from).collect::<Vec<_>>()
 }
 
 pub fn get_active_connection_name() -> Option<String> {
-    let active_conns = Exec::cmd("/sbin/nmcli")
-        .args(&["-g", "NAME", "connection", "show", "--active"])
-        .stdout(Redirection::Pipe)
-        .capture()
-        .unwrap()
-        .stdout_str();
+    let active_conns =
+        utils::cmd_output("/sbin/nmcli", &["-g", "NAME", "connection", "show", "--active"]);
 
     active_conns.lines().next().map(String::from)
 }
 
-pub fn get_dns_for_connection(conn_name: &str) -> Option<(String, String)> {
-    let ips = Exec::cmd("/sbin/nmcli")
-        .args(&["-g", "ipv4.dns,ipv6.dns", "con", "show", conn_name])
-        .stdout(Redirection::Pipe)
-        .capture()
-        .unwrap()
-        .stdout_str();
+/// DNS info returned from `NetworkManager`: (`ipv4_addrs`, `ipv6_addrs`, optional `DoT` hostname).
+/// The hostname is extracted from the NM `address#hostname` notation.
+pub struct DnsInfo {
+    pub ipv4: String,
+    pub ipv6: String,
+    pub dot_hostname: Option<String>,
+}
+
+pub fn get_dns_for_connection(conn_name: &str) -> Option<DnsInfo> {
+    let ips =
+        utils::cmd_output("/sbin/nmcli", &["-g", "ipv4.dns,ipv6.dns", "con", "show", conn_name]);
 
     let mut lines = ips.lines();
-    let ipv4_dns = lines.next().unwrap_or("").to_owned();
-    let ipv6_dns = lines.next().unwrap_or("").replace("\\:", ":");
+    let raw_ipv4 = lines.next().unwrap_or("").to_owned();
+    let raw_ipv6 = lines.next().unwrap_or("").replace("\\:", ":");
 
-    if ipv4_dns.is_empty() && ipv6_dns.is_empty() {
-        None
-    } else {
-        Some((ipv4_dns, ipv6_dns))
+    if raw_ipv4.is_empty() && raw_ipv6.is_empty() {
+        return None;
     }
+
+    // Extract DoT hostname from "addr#hostname" notation.
+    // All addresses in a connection share the same hostname, so take the first found.
+    let mut dot_hostname: Option<String> = None;
+    let strip_hostname = |s: &str, hostname: &mut Option<String>| -> String {
+        s.split(',')
+            .map(|addr| {
+                if let Some(pos) = addr.find('#') {
+                    if hostname.is_none() {
+                        *hostname = Some(addr[pos + 1..].to_string());
+                    }
+                    addr[..pos].to_string()
+                } else {
+                    addr.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+
+    let ipv4 = strip_hostname(&raw_ipv4, &mut dot_hostname);
+    let ipv6 = strip_hostname(&raw_ipv6, &mut dot_hostname);
+
+    Some(DnsInfo { ipv4, ipv6, dot_hostname })
+}
+
+/// Returns true if DNS-over-TLS is enabled (strict mode) for the given connection.
+pub fn get_dot_for_connection(conn_name: &str) -> bool {
+    let output = utils::cmd_output("/sbin/nmcli", &[
+        "-g",
+        "connection.dns-over-tls",
+        "con",
+        "show",
+        conn_name,
+    ]);
+    // value 2 = strict DoT
+    output.trim() == "2"
 }
 
 fn get_user_groups() -> Vec<String> {
-    let groups =
-        Exec::cmd("/sbin/groups").stdout(Redirection::Pipe).capture().unwrap().stdout_str();
+    let groups = utils::cmd_output("/sbin/groups", &[]);
     groups.split('\n').filter(|x| !x.is_empty()).map(String::from).collect::<Vec<_>>()
 }
 
@@ -66,17 +104,35 @@ pub fn change_dns_server(
     conn_name: &str,
     server_addr_ipv4: &str,
     server_addr_ipv6: &str,
+    enable_dot: bool,
+    dot_hostname: &str,
     dialog_tx: Sender<DialogMessage>,
 ) {
-    let status_code = utils::run_cmd(
-        format!(
-            "nmcli con mod '{conn_name}' ipv4.dns '{server_addr_ipv4}' && nmcli con mod \
-             '{conn_name}' ipv6.dns '{server_addr_ipv6}' && systemctl restart NetworkManager"
-        ),
-        true,
-    )
-    .unwrap();
-    if status_code.success() {
+    // When DoT is enabled and a hostname is provided, append #hostname to each address
+    // per NetworkManager's "address#servername" notation for SNI.
+    let ipv4_with_sni = if enable_dot && !dot_hostname.is_empty() {
+        dns::append_dot_hostname(server_addr_ipv4, dot_hostname)
+    } else {
+        server_addr_ipv4.to_string()
+    };
+    let ipv6_with_sni = if enable_dot && !dot_hostname.is_empty() {
+        dns::append_dot_hostname(server_addr_ipv6, dot_hostname)
+    } else {
+        server_addr_ipv6.to_string()
+    };
+
+    // dns-over-tls: -1 = default, 0 = no, 1 = opportunistic, 2 = yes (strict)
+    let dot_value = if enable_dot { 2 } else { 0 };
+    let result = (|| -> anyhow::Result<()> {
+        nmcli_mod(conn_name, "ipv4.dns", &ipv4_with_sni)?;
+        nmcli_mod(conn_name, "ipv4.dns-priority", "-1")?;
+        nmcli_mod(conn_name, "ipv6.dns", &ipv6_with_sni)?;
+        nmcli_mod(conn_name, "ipv6.dns-priority", "-1")?;
+        nmcli_mod(conn_name, "connection.dns-over-tls", &dot_value.to_string())?;
+        systemd_units::systemd_restart("NetworkManager.service", Scope::System)?;
+        Ok(())
+    })();
+    if result.is_ok() {
         dialog_tx
             .send(DialogMessage {
                 msg: fl!("dns-server-changed"),
@@ -96,15 +152,21 @@ pub fn change_dns_server(
 }
 
 pub fn reset_dns_server(conn_name: &str, dialog_tx: Sender<DialogMessage>) {
-    let status_code = utils::run_cmd(
-        format!(
-            "nmcli con mod '{conn_name}' ipv4.dns '' && nmcli con mod '{conn_name}' ipv6.dns '' \
-             && systemctl restart NetworkManager"
-        ),
-        true,
-    )
-    .unwrap();
-    if status_code.success() {
+    // Stop blocky if it was running (DoH mode)
+    stop_blocky();
+
+    let result = (|| -> anyhow::Result<()> {
+        nmcli_mod(conn_name, "ipv4.dns", "")?;
+        nmcli_mod(conn_name, "ipv6.dns", "")?;
+        nmcli_mod(conn_name, "ipv4.dns-priority", "0")?;
+        nmcli_mod(conn_name, "ipv6.dns-priority", "0")?;
+        nmcli_mod(conn_name, "ipv4.ignore-auto-dns", "no")?;
+        nmcli_mod(conn_name, "ipv6.ignore-auto-dns", "no")?;
+        nmcli_mod(conn_name, "connection.dns-over-tls", "-1")?;
+        systemd_units::systemd_restart("NetworkManager.service", Scope::System)?;
+        Ok(())
+    })();
+    if result.is_ok() {
         dialog_tx
             .send(DialogMessage {
                 msg: fl!("dns-server-reset"),
@@ -123,9 +185,107 @@ pub fn reset_dns_server(conn_name: &str, dialog_tx: Sender<DialogMessage>) {
     }
 }
 
+/// Set DNS to use `DoH` via blocky local proxy.
+/// Installs blocky if needed, writes its config, starts the service, and points NM to 127.0.0.1.
+pub fn change_dns_server_doh(
+    callback: RunCmdCallback,
+    conn_name: &str,
+    doh_url: &str,
+    bootstrap_ipv4: &str,
+    bootstrap_ipv6: &str,
+    dot_hostname: Option<&str>,
+    dialog_tx: Sender<DialogMessage>,
+) {
+    // 1. Install blocky if not present
+    if !utils::is_alpm_pkg_installed("blocky") {
+        const ALPM_PACKAGE_NAMES: [&str; 1] = ["blocky"];
+        install_needed_packages(
+            callback,
+            &ALPM_PACKAGE_NAMES,
+            fl!("doh-blocky-install-failed"),
+            Action::SetDnsServer,
+            dialog_tx.clone(),
+        );
+        if !utils::is_alpm_pkg_installed("blocky") {
+            return;
+        }
+    }
+
+    // 2. Generate and write blocky config
+    let config = dns::generate_blocky_config(doh_url, bootstrap_ipv4, bootstrap_ipv6, dot_hostname);
+
+    let write_result = (|| -> anyhow::Result<()> {
+        let mut tmp = tempfile::NamedTempFile::new()?;
+        io::Write::write_all(&mut tmp, config.as_bytes())?;
+        let status = utils::pkexec_cmd(&[
+            "install",
+            "-Dm644",
+            tmp.path().to_str().unwrap(),
+            dns::BLOCKY_CONFIG_PATH,
+        ])?;
+        anyhow::ensure!(status.success(), "failed to write blocky config");
+        Ok(())
+    })();
+    if write_result.is_err() {
+        dialog_tx
+            .send(DialogMessage {
+                msg: fl!("dns-server-failed"),
+                msg_type: MessageType::Error,
+                action: Action::SetDnsServer,
+            })
+            .expect("Couldn't send data to channel");
+        return;
+    }
+
+    // 3. Configure NM, restart NM, then (re)start blocky once network is back
+    // Use ignore-auto-dns to ensure all DNS goes through blocky — DHCP DNS
+    // would bypass the encrypted proxy. LAN names still work via mDNS/LLMNR.
+    let result = (|| -> anyhow::Result<()> {
+        systemd_units::systemd_enable(&[dns::BLOCKY_SERVICE], Scope::System, false)?;
+        nmcli_mod(conn_name, "ipv4.dns", "127.0.0.1")?;
+        nmcli_mod(conn_name, "ipv4.ignore-auto-dns", "yes")?;
+        nmcli_mod(conn_name, "ipv6.dns", "::1")?;
+        nmcli_mod(conn_name, "ipv6.ignore-auto-dns", "yes")?;
+        nmcli_mod(conn_name, "connection.dns-over-tls", "0")?;
+        systemd_units::systemd_restart("NetworkManager.service", Scope::System)?;
+        thread::sleep(Duration::from_secs(1));
+        systemd_units::systemd_restart(dns::BLOCKY_SERVICE, Scope::System)?;
+        Ok(())
+    })();
+
+    if result.is_ok() {
+        dialog_tx
+            .send(DialogMessage {
+                msg: fl!("dns-server-changed"),
+                msg_type: MessageType::Info,
+                action: Action::SetDnsServer,
+            })
+            .expect("Couldn't send data to channel");
+    } else {
+        dialog_tx
+            .send(DialogMessage {
+                msg: fl!("dns-server-failed"),
+                msg_type: MessageType::Error,
+                action: Action::SetDnsServer,
+            })
+            .expect("Couldn't send data to channel");
+    }
+}
+
+/// Stop blocky if it's running (used during reset or when switching away from `DoH`).
+pub fn stop_blocky() {
+    let _ = systemd_units::systemd_stop(dns::BLOCKY_SERVICE, Scope::System);
+    let _ = systemd_units::systemd_disable(&[dns::BLOCKY_SERVICE], Scope::System);
+}
+
+/// Returns true if blocky is currently active.
+pub fn is_blocky_active() -> bool {
+    systemd_units::systemd_is_active(dns::BLOCKY_SERVICE, Scope::System).unwrap_or(false)
+}
+
 pub fn remove_dblock(dialog_tx: Sender<DialogMessage>) {
     if Path::new("/var/lib/pacman/db.lck").exists() {
-        let _ = utils::run_cmd("rm /var/lib/pacman/db.lck".into(), true).unwrap();
+        let _ = utils::pkexec_cmd(&["rm", "/var/lib/pacman/db.lck"]);
         if !Path::new("/var/lib/pacman/db.lck").exists() {
             dialog_tx
                 .send(DialogMessage {
@@ -170,12 +330,7 @@ pub fn reinstall_packages(callback: RunCmdCallback) {
 
 pub fn remove_orphans(callback: RunCmdCallback, dialog_tx: Sender<DialogMessage>) {
     // check if you have orphans packages.
-    let mut orphan_pkgs = Exec::cmd("/sbin/pacman")
-        .arg("-Qtdq")
-        .stdout(Redirection::Pipe)
-        .capture()
-        .unwrap()
-        .stdout_str();
+    let mut orphan_pkgs = utils::cmd_output("/sbin/pacman", &["-Qtdq"]);
 
     // get list of packages separated by space,
     // and check if it's empty or not.
@@ -263,10 +418,8 @@ pub fn install_winboat(callback: RunCmdCallback, dialog_tx: Sender<DialogMessage
     const DOCKER_TARGET: &str = "docker.socket";
     let docker_enabled = systemd_units::check_system_units(DOCKER_TARGET);
     if utils::is_alpm_pkg_installed("docker") && !docker_enabled {
-        let (cmd, run_as_root) =
-            utils::get_tweak_toggle_cmd("service", DOCKER_TARGET, docker_enabled);
-        let status_code = utils::run_cmd(cmd, run_as_root).unwrap();
-        if !status_code.success() {
+        let result = systemd_units::systemd_enable(&[DOCKER_TARGET], Scope::System, false);
+        if result.is_err() {
             dialog_tx
                 .send(DialogMessage {
                     msg: fl!("winboat-install-failed"),
@@ -284,9 +437,9 @@ pub fn install_winboat(callback: RunCmdCallback, dialog_tx: Sender<DialogMessage
     let group_added = get_user_groups().iter().any(|x| x == "docker");
     if utils::is_alpm_pkg_installed("docker") && !group_added {
         if let Ok(current_user) = env::var("USER") {
-            let status_code =
-                utils::run_cmd(format!("/sbin/usermod -aG docker {current_user}"), true).unwrap();
-            if !status_code.success() {
+            let failed = utils::pkexec_cmd(&["/sbin/usermod", "-aG", "docker", &current_user])
+                .map_or(true, |s| !s.success());
+            if failed {
                 dialog_tx
                     .send(DialogMessage {
                         msg: fl!("winboat-install-failed"),

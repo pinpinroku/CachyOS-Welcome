@@ -6,7 +6,7 @@ use std::{fs, slice, str};
 
 use gtk::prelude::*;
 
-use subprocess::{Exec, ExitStatus};
+use subprocess::{Exec, ExitStatus, Redirection};
 
 #[derive(Debug)]
 pub enum PacmanWrapper {
@@ -138,6 +138,21 @@ pub fn run_cmd(cmd: String, escalate: bool) -> anyhow::Result<ExitStatus> {
     }
 }
 
+/// Run a command and capture its stdout. Args passed directly via execvp (no shell).
+pub fn cmd_output(cmd: &str, args: &[&str]) -> String {
+    Exec::cmd(cmd).args(args).stdout(Redirection::Pipe).capture().unwrap().stdout_str()
+}
+
+/// Run a command via pkexec. Args passed directly (no shell).
+pub fn pkexec_cmd(args: &[&str]) -> anyhow::Result<ExitStatus> {
+    Ok(Exec::cmd("/sbin/pkexec").args(args).join()?)
+}
+
+/// Spawn a detached child process.
+pub fn spawn_detached(path: &str) -> anyhow::Result<ExitStatus> {
+    Ok(Exec::cmd(path).detached().join()?)
+}
+
 #[inline]
 pub fn get_pacman_wrapper() -> PacmanWrapper {
     if Path::new("/sbin/aura").exists() {
@@ -157,29 +172,6 @@ pub fn is_alpm_pkg_installed(package_name: &str) -> bool {
     let pacman = pacmanconf::Config::with_opts(None, Some("/etc/pacman.conf"), Some("/")).unwrap();
     let alpm = alpm_utils::alpm_with_conf(&pacman).unwrap();
     alpm.localdb().pkg(package_name.as_bytes()).is_ok()
-}
-
-pub fn get_tweak_toggle_cmd(
-    action_type: &str,
-    action_data: &str,
-    action_enabled: bool,
-) -> (String, bool) {
-    let sysaction = if action_enabled { "disable --now" } else { "enable --now" };
-    let run_as_root = action_type != "user_service";
-
-    let cmd = if !action_enabled {
-        if run_as_root {
-            format!("systemctl {sysaction} --force {action_data}")
-        } else {
-            format!("systemctl --user {sysaction} --force {action_data}")
-        }
-    } else if !run_as_root {
-        format!("systemctl --user {sysaction} {action_data}")
-    } else {
-        format!("systemctl {sysaction} {action_data}")
-    };
-
-    (cmd, false)
 }
 
 #[cfg(test)]
